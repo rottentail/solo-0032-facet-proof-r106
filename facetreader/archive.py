@@ -7,8 +7,13 @@ import zipfile
 import zlib
 from .errors import InvalidBundle, require
 
-CHANNELS = frozenset({"color.rgb", "depth.f32", "object.u32",
-                      "color.png", "depth.png", "object.png"})
+CHANNELS_V1 = frozenset({"color.rgb", "depth.f32", "object.u32",
+                         "color.png", "depth.png", "object.png"})
+# Version two adds the contributor identity, observed layer count, truncation
+# flag and a contributor preview PNG. Both sets are accepted; they never mix.
+CHANNELS_V2 = frozenset(CHANNELS_V1 | {
+    "contributor.u32", "layers.u16", "truncated.u8", "contributor.png"})
+CHANNELS = CHANNELS_V1 | CHANNELS_V2
 MEMBERS = frozenset({"plate.json", "seal.json"}) | {
     "passes/" + name for name in CHANNELS}
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
@@ -32,7 +37,13 @@ def _limit(name):
         return MAX_JSON_BYTES
     if name.endswith(".png"):
         return 4 * 1024 * 1024
-    return MAX_SIDE * MAX_SIDE * (3 if name.endswith(".rgb") else 4)
+    if name.endswith(".rgb"):
+        return MAX_SIDE * MAX_SIDE * 3
+    if name.endswith(".u16"):
+        return MAX_SIDE * MAX_SIDE * 2
+    if name.endswith(".u8"):
+        return MAX_SIDE * MAX_SIDE
+    return MAX_SIDE * MAX_SIDE * 4
 
 
 def read_members(raw):
@@ -61,7 +72,13 @@ def read_members(raw):
                         "archive_size", "Archive member exceeds decoded size limit")
                 total += entry.file_size
                 require(total <= MAX_UNPACKED_BYTES, "archive_size", "Decoded archive exceeds limit")
-            require(names == MEMBERS, "archive_members", "Bundle must contain exactly two metadata files and six channels")
+            # The exact v1/v2 channel set is enforced in format.py after the
+            # plate format is known; here members only have to belong to one of
+            # the frozen sets (plus the two metadata documents).
+            require({"plate.json", "seal.json"} <= names, "archive_members",
+                    "Bundle must contain both metadata documents")
+            require(names <= MEMBERS, "archive_members",
+                    "Bundle contains a member outside the frozen channel sets")
             result = {}
             for entry in entries:
                 with archive.open(entry) as stream:

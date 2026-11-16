@@ -1,12 +1,19 @@
-"""Version-one plate semantics, independent of the producer's Python code."""
+"""Versioned plate semantics, independent of the producer's Python code."""
 import hashlib
 import json
 import math
 import re
 import struct
-from .archive import CHANNELS, MAX_SIDE, read_members
+from .archive import CHANNELS_V1, CHANNELS_V2, MAX_SIDE, read_members
 from .errors import InvalidBundle, require
 from .png import decode_rgb
+
+PLATE_FORMAT_V1 = "facet-plate-1"
+PLATE_FORMAT_V2 = "facet-plate-2"
+RAW_STRIDE = {"color.rgb": 3, "depth.f32": 4, "object.u32": 4,
+              "contributor.u32": 4, "layers.u16": 2, "truncated.u8": 1}
+OBJECT_FACTORS = (73, 151, 199)
+CONTRIBUTOR_FACTORS = (199, 121, 73)
 
 TRUST = {
     "verified": "Internal byte integrity and metadata/channel consistency only",
@@ -97,8 +104,12 @@ def evaluate(raw):
     seal = _json(members["seal.json"], "seal.json")
     payload = _object(plate.get("payload"), "plate.payload")
     frozen = _object(seal.get("payload"), "seal.payload")
-    require(payload.get("format") == "facet-plate-1" and frozen.get("format") == "facet-seal-1",
+    plate_format = payload.get("format")
+    require(plate_format in (PLATE_FORMAT_V1, PLATE_FORMAT_V2)
+            and frozen.get("format") == "facet-seal-1",
             "format", "Unsupported plate or seal format")
+    transparent = plate_format == PLATE_FORMAT_V2
+    expected_channels = CHANNELS_V2 if transparent else CHANNELS_V1
     require(plate.get("state") == "ready" and seal.get("kind") == "seal"
             and seal.get("state") == "frozen", "metadata_state", "Unexpected embedded plate or seal state")
     plate_id = _text(plate.get("id"), "plate.id")
@@ -123,8 +134,11 @@ def evaluate(raw):
     _text(request.get("renderer"), "request.renderer")
     objects = _objects(frozen, payload.get("objects"))
     descriptors = _object(payload.get("passes"), "passes")
-    require(set(descriptors) == CHANNELS, "channels", "Expected exactly the six version-one channels")
-    for name in sorted(CHANNELS):
+    require(set(descriptors) == expected_channels, "channels",
+            "Channel set does not match the frozen plate format")
+    if transparent:
+        _validate_transparency(payload, request)
+    for name in sorted(expected_channels):
         descriptor = _object(descriptors[name], "descriptor")
         require(set(descriptor) == {"sha256", "size"}, "descriptor", "Unexpected descriptor fields")
         data = members["passes/" + name]
@@ -133,7 +147,7 @@ def evaluate(raw):
         require(_checksum(descriptor.get("sha256"), "descriptor.sha256") == hashlib.sha256(data).hexdigest(),
                 "channel_hash", "Channel checksum mismatch: " + name)
         if not name.endswith(".png"):
-            stride = 3 if name == "color.rgb" else 4
+            stride = RAW_STRIDE[name]
             require(size == width * height * stride, "extent", "Raw channel extent mismatch: " + name)
     require(_checksum(payload.get("visual_hash"), "visual_hash") == _digest(descriptors),
             "visual_hash", "Channel manifest checksum mismatch")
@@ -152,12 +166,24 @@ def evaluate(raw):
     first_foreground = False
     first_background = False
     object_preview = decoded["object.png"]
+    truncation_bytes = members["passes/truncated.u8"] if transparent else None
+    layers_bytes = members["passes/layers.u16"] if transparent else None
+    contributor_bytes = members["passes/contributor.u32"] if transparent else None
+    contributor_png = (decode_rgb(members["passes/contributor.png"], width, height)
+                       if transparent else None)
+    truncated_pixels = 0
+    observed_max = 0
     for offset, ((depth,), (index,)) in enumerate(zip(depths, indices)):
         if index == 0:
             require(depth == math.inf, "depth_background", "Background must have positive infinite depth")
             background += 1
             take = not first_background
             first_background = True
+            if transparent:
+                require(truncation_bytes[offset] == 0 and
+                        struct.unpack_from("<H", layers_bytes, offset*2)[0] == 0 and
+                        struct.unpack_from("<I", contributor_bytes, offset*4)[0] == 0,
+                        "transparency_background", "Background pixel carries transparency data")
         else:
             require(str(index) in objects, "object_index", "Pixel refers to an unknown object")
             require(math.isfinite(depth) and depth > 0,
@@ -167,13 +193,35 @@ def evaluate(raw):
             maximum = max(maximum, depth)
             take = not first_foreground
             first_foreground = True
-        expected_color = bytes(((index * factor) % 255) if index else 0 for factor in (73, 151, 199))
+            if transparent:
+                contributor = struct.unpack_from("<I", contributor_bytes, offset*4)[0]
+                observed = struct.unpack_from("<H", layers_bytes, offset*2)[0]
+                flag = truncation_bytes[offset]
+                require(flag in (0, 1), "truncation", "Truncation flag must be binary")
+                require(observed >= 1, "layers", "Foreground pixel must observe at least one layer")
+                require(contributor == 0 or str(contributor) in objects,
+                        "contributor_index", "Contributor refers to an unknown object")
+                truncated_pixels += flag
+                observed_max = max(observed_max, observed)
+                expected_c = bytes(((contributor * factor) % 255) if contributor else 0
+                                   for factor in CONTRIBUTOR_FACTORS)
+                require(contributor_png[offset*3:offset*3+3] == expected_c,
+                        "contributor_preview", "Contributor preview disagrees with its identifier")
+        expected_color = bytes(((index * factor) % 255) if index else 0 for factor in OBJECT_FACTORS)
         require(object_preview[offset*3:offset*3+3] == expected_color,
                 "object_preview", "Object preview disagrees with the identifier channel")
         if take or offset in sample_offsets:
-            picks.append({"x": offset % width, "y": offset // width, "object_index": index,
-                          "object": objects.get(str(index)), "depth": depth if index else None,
-                          "seal_id": seal_id})
+            pick = {"x": offset % width, "y": offset // width, "object_index": index,
+                    "object": objects.get(str(index)), "depth": depth if index else None,
+                    "seal_id": seal_id}
+            if transparent:
+                cid = struct.unpack_from("<I", contributor_bytes, offset*4)[0]
+                pick.update({"surface_object": objects.get(str(index)),
+                             "contributor_index": cid,
+                             "contributor_object": objects.get(str(cid)),
+                             "observed_layers": struct.unpack_from("<H", layers_bytes, offset*2)[0],
+                             "truncated": bool(truncation_bytes[offset])})
+            picks.append(pick)
     statistics = _object(payload.get("statistics"), "statistics")
     require(statistics.get("byte_order") == "little"
             and statistics.get("background_depth") == "positive_infinity"
@@ -181,12 +229,31 @@ def evaluate(raw):
             "channel_semantics", "Unexpected raw-channel interpretation")
     require(type(statistics.get("covered_pixels")) is int and statistics["covered_pixels"] == covered,
             "coverage", "Coverage count disagrees with the identifier channel")
+    transparency_summary = None
+    if transparent:
+        require(type(statistics.get("truncated_pixels")) is int and
+                statistics["truncated_pixels"] == truncated_pixels,
+                "truncation", "Truncation statistics disagree with the truncation channel")
+        require(type(statistics.get("observed_layer_max")) is int and
+                statistics["observed_layer_max"] == observed_max,
+                "layers", "Observed layer maximum disagrees with the layers channel")
+        require(statistics["layer_budget"] == payload["transparency"]["layer_budget"],
+                "transparency", "Layer budget differs between statistics and frozen semantics")
+        transparency_summary = {
+            "model": payload["transparency"]["model"],
+            "layer_budget": statistics["layer_budget"],
+            "observed_layer_max": observed_max,
+            "truncated_pixels": truncated_pixels,
+            "truncated_samples": statistics["truncated_samples"],
+            "overflow_fragments": statistics["overflow_fragments"],
+            "identity_lost_beyond_budget": truncated_pixels > 0}
     report = {
-        "valid": True, "format": "facet-plate-1",
+        "valid": True, "format": plate_format,
         "summary": {"width": width, "height": height, "samples": samples,
                     "covered_pixels": covered, "background_pixels": background,
                     "objects": len(objects), "finite_depth_range": [minimum, maximum] if covered else None,
-                    "depth_units": "camera_forward_distance", "object_id_scope": "local_to_this_plate"},
+                    "depth_units": "camera_forward_distance", "object_id_scope": "local_to_this_plate",
+                    "transparency": transparency_summary},
         "provenance": {"plate_id": plate_id, "exposure_id": exposure_id, "seal_id": seal_id,
                        "seal_hash": content_hash, "lens_hash": payload["lens_hash"],
                        "visual_hash": payload["visual_hash"], "renderer": request["renderer"],
@@ -201,3 +268,18 @@ def evaluate(raw):
         "channels": descriptors, "picks": picks, "trust": dict(TRUST),
     }
     return report, members
+
+
+def _validate_transparency(payload, request):
+    semantics = _object(payload.get("transparency"), "transparency")
+    require(semantics.get("model") == "front_to_back_over"
+            and semantics.get("surface_identity") == "nearest_named_fragment"
+            and semantics.get("contributor_identity") == "largest_named_color_contribution"
+            and semantics.get("overflow") == "order_independent_weighted_tail",
+            "transparency", "Unsupported frozen transparency semantics")
+    budget = _integer(semantics.get("layer_budget"), 1, 64, "transparency.layer_budget")
+    require(payload.get("renderer") == "facet-raster-2" and request.get("renderer") == "facet-raster-2",
+            "transparency", "Transparent plate must name the transparency renderer")
+    statistics = _object(payload.get("statistics"), "statistics")
+    require(statistics.get("layer_budget") == budget,
+            "transparency", "Statistics and frozen semantics disagree on the layer budget")

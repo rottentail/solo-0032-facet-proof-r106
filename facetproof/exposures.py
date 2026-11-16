@@ -26,10 +26,18 @@ class Exposures:
 
     def submit(self, seal_id, data):
         request = validate_request(data)
-        dedup_key = key(data.get("key"), "key")
-        request_hash = digest({"seal_id": seal_id, "request": request})
         with self.db.unit_of_work() as conn:
-            self.db.get(conn, seal_id, "seal")
+            seal = self.db.get(conn, seal_id, "seal")
+            # Resolve the renderer revision from the frozen closure at submit
+            # time so the idempotent hash already names the transparency
+            # semantics; a later pigment edit cannot change a sealed closure.
+            transparent = any(item["pigment"].get("opacity", 1) < 1
+                              for item in seal["payload"]["closure"])
+            if transparent:
+                from .planner import TRANSPARENT_REVISION
+                request["renderer"] = TRANSPARENT_REVISION
+            dedup_key = key(data.get("key"), "key")
+            request_hash = digest({"seal_id": seal_id, "request": request})
             old = conn.execute("SELECT id,request_hash FROM exposures WHERE dedup_key=?", (dedup_key,)).fetchone()
             if old:
                 require(old["request_hash"] == request_hash, "key_conflict", "Key already names a different exposure", 409)

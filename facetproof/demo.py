@@ -7,7 +7,105 @@ from .application import Application
 from .errors import Fault, require
 from .routing import route_request, PREFIX
 
-FLOWS = ["mesh-intake", "mesh-retirement", "assembly-edit", "lens-edit", "seal-closure", "exposure-submit", "render-plates", "cancel-exposure", "retry-exposure", "verify-plate", "pixel-pick", "compare-plates", "proof-decision", "quarantine-plate", "recover-lease", "export-bundle", "reserve-capacity", "settle-capacity", "resize-capacity", "tile-progress", "offline-inspect", "backup-closure", "content-inspection"]
+FLOWS = ["mesh-intake", "mesh-retirement", "assembly-edit", "lens-edit", "seal-closure", "exposure-submit", "render-plates", "cancel-exposure", "retry-exposure", "verify-plate", "pixel-pick", "compare-plates", "proof-decision", "quarantine-plate", "recover-lease", "export-bundle", "reserve-capacity", "settle-capacity", "resize-capacity", "tile-progress", "offline-inspect", "backup-closure", "content-inspection", "transparency-shell"]
+
+BOX_FACES = [[0,1,2],[0,2,3],[4,6,5],[4,7,6],[0,4,5],[0,5,1],[2,6,7],[2,7,3],
+             [1,5,6],[1,6,2],[0,3,7],[0,7,4]]
+BOX_VERTICES = [[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]]
+
+
+def _box(call, name, scale):
+    vertices = [[coordinate * scale for coordinate in point] for point in BOX_VERTICES]
+    return call("POST", "meshes", {"name": name, "vertices": vertices, "faces": BOX_FACES})
+
+
+def _transparency_flow(call, rejected):
+    # A transparent outer shell and a transparent middle shell surround an
+    # opaque core, so a center pixel crosses several depth-sorted layers.
+    shell = _box(call, "透明外壳", 1.0)
+    middle = _box(call, "透明夹层", 0.7)
+    core = _box(call, "不透明内芯", 0.35)
+    shell_pigment = call("POST", "pigments", {"name": "外壳玻璃", "color": [.1, .3, .9],
+                                               "opacity": .25, "two_sided": True})
+    middle_pigment = call("POST", "pigments", {"name": "夹层玻璃", "color": [.2, .8, .5],
+                                               "opacity": .3, "two_sided": True})
+    core_pigment = call("POST", "pigments", {"name": "内芯漆面", "color": [.95, .95, .95],
+                                              "opacity": .9, "two_sided": True})
+    placements = [
+        {"key": "shell", "mesh_id": shell["id"], "pigment_id": shell_pigment["id"]},
+        {"key": "middle", "mesh_id": middle["id"], "pigment_id": middle_pigment["id"]},
+        {"key": "core", "mesh_id": core["id"], "pigment_id": core_pigment["id"]}]
+
+    def render(order, key, budget):
+        assembly = call("POST", "assemblies", {"name": "透明结构", "lens": {"eye": [0, 0, 6]}})
+        call("PUT", "assemblies/"+assembly["id"], {"revision": 1, "placements": order})
+        seal = call("POST", "assemblies/"+assembly["id"]+"/seal", {"revision": 2})
+        call("POST", "seals/"+seal["id"]+"/exposures",
+             {"key": key, "width": 64, "height": 64, "samples": 1, "layer_budget": budget})
+        rendered = call("POST", "worker/step")
+        require(rendered["state"] == "succeeded", "commission", str(rendered), 500)
+        return seal, rendered["plate"]
+
+    seal, plate = render(placements, "transparent-reference", 8)
+    payload = plate["payload"]
+    require(payload["format"] == "facet-plate-2", "commission", "Transparent scene must use plate v2", 500)
+    stats = payload["statistics"]
+    require(stats["transparency"]["model"] == "front_to_back_over"
+            and stats["layer_budget"] == 8, "commission", "Frozen transparency semantics missing", 500)
+    # The two identity uses are separate channels and must not be conflated.
+    pick = call("GET", "plates/"+plate["id"]+"/pick?x=32&y=32")
+    require(pick["surface_object"]["key"] == "shell", "commission", "Surface identity is not the outer shell", 500)
+    require(pick["contributor_object"]["key"] == "core", "commission", "Contributor identity is not the inner core", 500)
+    require(pick["semantics"] == "facet-transparency-1", "commission", "Pick lacks frozen semantics", 500)
+
+    # Reversing part order cannot change any channel: depth, not submission
+    # order, decides occlusion.
+    _, reversed_plate = render(list(reversed(placements)), "transparent-reversed", 8)
+    require(reversed_plate["payload"]["visual_hash"] == payload["visual_hash"],
+            "commission", "Reordering placements changed the image", 500)
+
+    # A budget below the overlap count truncates identity but preserves color;
+    # the statistics say exactly where detail was lost.
+    _, tight_plate = render(placements, "transparent-tight", 1)
+    tight = tight_plate["payload"]["statistics"]
+    require(tight["truncated_pixels"] > 0 and tight["overflow_fragments"] > 0,
+            "commission", "Overflow was not reported under a tight layer budget", 500)
+    tight_pick = call("GET", "plates/"+tight_plate["id"]+"/pick?x=32&y=32")
+    require(tight_pick["truncated"] and tight_pick["identity_loss"] == "overflow_tail",
+            "commission", "Truncated pixel was not flagged for review", 500)
+    color_a = call("GET", "plates/"+plate["id"]+"/passes/color.rgb")[0]
+    color_b = call("GET", "plates/"+tight_plate["id"]+"/passes/color.rgb")[0]
+    # No overflow fragment is discarded: the tail retains every fragment's
+    # color via alpha-weighted aggregation and exact aggregate coverage. A
+    # tighter budget moves more layers from exact over into the documented
+    # order-independent tail approximation, so colors stay close rather than
+    # bit-identical. Bound that approximation and report the observed delta.
+    max_color_delta = max(abs(left - right) for left, right in zip(color_a, color_b))
+    require(max_color_delta <= 48, "commission",
+            "Tail approximation exceeded its bounded color deviation", 500)
+
+    # The independent offline reader reconstructs the same frozen semantics.
+    from facetreader import validate_bundle
+    report = validate_bundle(call("GET", "plates/"+plate["id"]+"/bundle")[0])
+    require(report["valid"] and report["format"] == "facet-plate-2"
+            and report["summary"]["transparency"]["model"] == "front_to_back_over",
+            "commission", str(report), 500)
+    result = {"workflow": "transparency-shell", "statistics": stats,
+              "pick": {"surface": pick["surface_object"]["key"],
+                       "contributor": pick["contributor_object"]["key"],
+                       "observed_layers": pick["observed_layers"]},
+              "order_invariant": True,
+              "truncation": {"truncated_pixels": tight["truncated_pixels"],
+                             "overflow_fragments": tight["overflow_fragments"],
+                             "no_fragment_dropped": True,
+                             "tail_approximation": "order_independent_weighted",
+                             "max_color_byte_delta": max_color_delta},
+              "offline": report["summary"]["transparency"],
+              "rejected": rejected("POST", "seals/"+seal["id"]+"/exposures",
+                                   {"key": "bad-budget", "width": 32, "height": 32,
+                                    "layer_budget": 0}, "integer")}
+    return result
+
 
 def commission(root, flow, output=None):
     app = Application(root)
@@ -24,6 +122,8 @@ def commission(root, flow, output=None):
     assembly = call("POST", "assemblies", {"name":"斜翼结构说明图", "lens":{"eye":[3,2,4]}})
     assembly = call("PUT", "assemblies/"+assembly["id"], {"revision":1, "placements":[{"key":"wing", "mesh_id":mesh["id"], "pigment_id":pigment["id"], "transform":{"euler":[0,20,0]}}]})
     result = {"workflow":flow}
+    if flow == "transparency-shell":
+        return _transparency_flow(call, rejected)
     if flow == "mesh-intake":
         result["rejected"] = rejected("POST", "meshes", {**mesh_data, "faces":[[0,0,1]]}, "face")
         return result

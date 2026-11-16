@@ -28,6 +28,12 @@ def main(argv=None):
                     (arguments.output / name).write_text(json.dumps(value, ensure_ascii=False, sort_keys=True,
                                                                   indent=2, allow_nan=False) + "\n", encoding="utf-8")
                 (arguments.output / "color.png").write_bytes(members["passes/color.png"])
+                # The two identity previews let an offline reviewer reproduce
+                # both frozen choices: surface (material editing) and the
+                # dominant contributor (interior localization).
+                (arguments.output / "object.png").write_bytes(members["passes/object.png"])
+                if "passes/contributor.png" in members:
+                    (arguments.output / "contributor.png").write_bytes(members["passes/contributor.png"])
             except OSError as exc:
                 raise InvalidBundle("output_write", "Cannot write the output directory") from exc
         print(json.dumps(report, ensure_ascii=False, sort_keys=True, allow_nan=False))

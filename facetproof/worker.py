@@ -2,7 +2,7 @@ import time
 from .errors import Fault, require
 from .planner import build_plan
 from .tile_renderer import TileEngine
-from .passes import serialize_passes
+from .passes import serialize_passes, PLATE_FORMAT_V1, PLATE_FORMAT_V2
 from .values import digest
 
 
@@ -36,12 +36,19 @@ class Worker:
             for name, data in passes.items():
                 checkpoint()
                 descriptors[name] = self.blobs.put(data)
-            payload = {"format": "facet-plate-1", "seal_id": exposure["seal_id"],
+            plate_format = PLATE_FORMAT_V2 if plan.get("transparent") else PLATE_FORMAT_V1
+            payload = {"format": plate_format, "seal_id": exposure["seal_id"],
                        "seal_hash": seal["content_hash"], "request": exposure["request"],
                        "width": exposure["request"]["width"], "height": exposure["request"]["height"],
                        "lens_hash": plan["lens_hash"], "objects": plan["objects"],
                        "passes": descriptors, "statistics": statistics,
                        "visual_hash": digest(descriptors)}
+            if plan.get("transparent"):
+                # The frozen transparency block is embedded so offline readers
+                # can prove which compositing and identity semantics produced
+                # the channels without importing producer code.
+                payload["transparency"] = plan["transparency"]
+                payload["renderer"] = plan["renderer"]
             self.exposures.heartbeat(exposure["id"], exposure["token"])
             plate = self.plates.finish(exposure, payload)
             return {"state": "succeeded", "exposure_id": exposure["id"], "plate": plate}

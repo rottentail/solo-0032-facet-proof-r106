@@ -54,6 +54,8 @@ class Plates:
     def verify_payload(self, payload):
         results = {}
         width, height = payload["width"], payload["height"]
+        raw_stride = {"color.rgb": 3, "depth.f32": 4, "object.u32": 4,
+                      "contributor.u32": 4, "layers.u16": 2, "truncated.u8": 1}
         for name, descriptor in payload["passes"].items():
             data = self.blobs.read(descriptor["sha256"])
             require(len(data) == descriptor["size"], "size", "Plate pass size mismatch", 409)
@@ -61,7 +63,8 @@ class Plates:
                 info = inspect_png(data)
                 require(info["width"] == width and info["height"] == height, "extent", "PNG extent mismatch", 409)
             else:
-                stride = 3 if name == "color.rgb" else 4
+                stride = raw_stride.get(name)
+                require(stride is not None, "pass", "Unknown raw plate pass", 409)
                 require(len(data) == width*height*stride, "extent", "Raw pass extent mismatch", 409)
             results[name] = descriptor["sha256"]
         return {"valid": True, "passes": results}
@@ -73,11 +76,36 @@ class Plates:
             x = integer(x, "x", 0, payload["width"]-1)
             y = integer(y, "y", 0, payload["height"]-1)
             offset = (y*payload["width"]+x) * 4
-            index = struct.unpack_from("<I", self.blobs.read(payload["passes"]["object.u32"]["sha256"]), offset)[0]
-            distance = struct.unpack_from("<f", self.blobs.read(payload["passes"]["depth.f32"]["sha256"]), offset)[0]
-            return {"x": x, "y": y, "object": payload["objects"].get(str(index)),
-                    "depth": distance if math.isfinite(distance) else None,
-                    "seal_id": payload["seal_id"]}
+            passes = payload["passes"]
+            index = struct.unpack_from("<I", self.blobs.read(passes["object.u32"]["sha256"]), offset)[0]
+            distance = struct.unpack_from("<f", self.blobs.read(passes["depth.f32"]["sha256"]), offset)[0]
+            result = {"x": x, "y": y,
+                      # Surface identity answers "which shell is in front, so I
+                      # can edit its material". It is the only meaning the
+                      # legacy object channel ever had.
+                      "object": payload["objects"].get(str(index)),
+                      "surface_object": payload["objects"].get(str(index)),
+                      "depth": distance if math.isfinite(distance) else None,
+                      "seal_id": payload["seal_id"]}
+            if "contributor.u32" in passes:
+                # Contributor identity answers a different question: which named
+                # interior part contributes the most color here. It is reported
+                # separately so the two uses can never be conflated.
+                contributor_index = struct.unpack_from(
+                    "<I", self.blobs.read(passes["contributor.u32"]["sha256"]), offset)[0]
+                layer_offset = (y*payload["width"]+x) * 2
+                observed = struct.unpack_from("<H", self.blobs.read(passes["layers.u16"]["sha256"]),
+                                              layer_offset)[0]
+                truncation_offset = y*payload["width"]+x
+                truncated = self.blobs.read(passes["truncated.u8"]["sha256"])[truncation_offset]
+                result.update({
+                    "contributor_object": payload["objects"].get(str(contributor_index)),
+                    "observed_layers": observed,
+                    "layer_budget": payload["statistics"]["layer_budget"],
+                    "truncated": bool(truncated),
+                    "identity_loss": "overflow_tail" if truncated else None,
+                    "semantics": "facet-transparency-1"})
+            return result
 
     def quarantine(self, plate_id, reason):
         from .values import text

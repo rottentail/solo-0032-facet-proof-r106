@@ -2,6 +2,11 @@
 
 Tile channels precede downsampling: depth is IEEE f64, linear color is f32,
 and object identity is u32, all little endian. A tile is never a final plate.
+
+Two frozen channel sets coexist. ``facet-tile-1`` serves the legacy opaque
+renderer and is unchanged. ``facet-tile-2`` adds the transparency channels:
+the contributor identity, its color contribution score, the observed named
+layer count and a per-sample truncation flag. Sets never mix inside a tile.
 """
 from array import array
 import math
@@ -12,9 +17,17 @@ from .errors import require
 from .values import digest, integer
 
 TILE_FORMAT = "facet-tile-1"
+TILE_FORMAT_V2 = "facet-tile-2"
 TILE_RENDERER = "facet-window-raster-1"
+TILE_RENDERER_V2 = "facet-window-raster-2"
 CHANNELS = {"depth.f64": ("d", 8, 1), "color.f32": ("f", 4, 3),
             "object.u32": ("I", 4, 1)}
+CHANNELS_V2 = {**CHANNELS,
+               "contributor.u32": ("I", 4, 1),
+               "contribution.f32": ("f", 4, 1),
+               "layers.u16": ("H", 2, 1),
+               "truncated.u8": ("B", 1, 1),
+               "overflow.u32": ("I", 4, 1)}
 
 
 def grid(width, height, edge=64):
@@ -25,12 +38,19 @@ def grid(width, height, edge=64):
             for y in range(0, height, edge) for x in range(0, width, edge)]
 
 
+def _definition(plan):
+    if plan.get("transparent"):
+        return TILE_FORMAT_V2, TILE_RENDERER_V2, CHANNELS_V2
+    return TILE_FORMAT, TILE_RENDERER, CHANNELS
+
+
 def fingerprint(exposure, plan, seal_hash, edge):
     request = exposure["request"]
     require(plan["width"] == request["width"] * request["samples"] and
             plan["height"] == request["height"] * request["samples"],
             "tile_extent", "Render plan does not match the exposure", 409)
-    return digest({"format": TILE_FORMAT, "tile_renderer": TILE_RENDERER,
+    tile_format, tile_renderer, _ = _definition(plan)
+    return digest({"format": tile_format, "tile_renderer": tile_renderer,
                    "seal_id": exposure["seal_id"], "seal_hash": seal_hash,
                    "request_hash": exposure["request_hash"], "request": request,
                    "renderer": request["renderer"], "edge": edge,
@@ -85,7 +105,16 @@ def _values(raw, code, itemsize):
     return result
 
 
-def _samples(depth, colors, ids, pixels, objects=None):
+def _channel_set(payload):
+    fmt = payload.get("format")
+    if fmt == TILE_FORMAT_V2:
+        return CHANNELS_V2
+    if fmt == TILE_FORMAT:
+        return CHANNELS
+    require(False, "tile_format", "Unknown persisted tile format", 409)
+
+
+def _samples(depth, colors, ids, pixels, objects=None, extra=None):
     require(len(depth) == pixels and len(ids) == pixels and len(colors) == pixels * 3,
             "tile_extent", "Tile channel extent mismatch", 409)
     for distance, object_id in zip(depth, ids):
@@ -96,17 +125,51 @@ def _samples(depth, colors, ids, pixels, objects=None):
             require(str(object_id) in objects, "tile_semantics", "Tile object is absent from the frozen mapping", 409)
     require(all(math.isfinite(value) for value in colors),
             "tile_semantics", "Tile color contains nonfinite samples", 409)
+    if extra is not None:
+        contributors, contribution, layers, truncated, overflow = extra
+        require(len(contributors) == pixels and len(contribution) == pixels and
+                len(layers) == pixels and len(truncated) == pixels and len(overflow) == pixels,
+                "tile_extent", "Transparency channel extent mismatch", 409)
+        for index in range(pixels):
+            if ids[index] == 0:
+                require(contributors[index] == 0 and layers[index] == 0 and truncated[index] == 0
+                        and overflow[index] == 0,
+                        "tile_semantics", "Background sample carries transparency data", 409)
+            else:
+                if contributors[index] != 0 and objects is not None:
+                    require(str(contributors[index]) in objects,
+                            "tile_semantics", "Contributor is absent from the frozen mapping", 409)
+                require(1 <= layers[index], "tile_semantics", "Foreground sample must observe a layer", 409)
+                require(truncated[index] in (0, 1), "tile_semantics", "Truncation flag must be binary", 409)
+                require(overflow[index] >= 0, "tile_semantics", "Overflow count must be nonnegative", 409)
+        require(all(math.isfinite(value) and value >= 0 for value in contribution),
+                "tile_semantics", "Contribution scores must be finite and nonnegative", 409)
 
 
-def encode(rendered, bounds, expected_fingerprint, blobs):
+def encode(rendered, bounds, expected_fingerprint, blobs, *, transparent=False, objects=None):
     pixels = validate_bounds(bounds)
     depth, colors, ids = rendered["depth"], rendered["colors"], rendered["ids"]
-    _samples(depth, colors, ids, pixels)
+    if transparent:
+        extra = (rendered["contributors"], rendered["contribution"],
+                 rendered["observed_layers"], rendered["truncated"],
+                 rendered["overflow_fragments"])
+        _samples(depth, colors, ids, pixels, objects, extra=extra)
+        raw = {"depth.f64": _raw(depth, "d", 8), "color.f32": _raw(colors, "f", 4),
+               "object.u32": _raw(ids, "I", 4),
+               "contributor.u32": _raw(rendered["contributors"], "I", 4),
+               "contribution.f32": _raw(rendered["contribution"], "f", 4),
+               "layers.u16": _raw(rendered["observed_layers"], "H", 2),
+               "truncated.u8": _raw(array("B", rendered["truncated"]), "B", 1),
+               "overflow.u32": _raw(rendered["overflow_fragments"], "I", 4)}
+        tile_format = TILE_FORMAT_V2
+    else:
+        _samples(depth, colors, ids, pixels)
+        raw = {"depth.f64": _raw(depth, "d", 8), "color.f32": _raw(colors, "f", 4),
+               "object.u32": _raw(ids, "I", 4)}
+        tile_format = TILE_FORMAT
     fragments = integer(rendered["fragments"], "tile fragments", 0, 2**63 - 1)
     triangles = integer(rendered["triangles"], "tile triangles", 0, 2**63 - 1)
-    raw = {"depth.f64": _raw(depth, "d", 8), "color.f32": _raw(colors, "f", 4),
-           "object.u32": _raw(ids, "I", 4)}
-    return {"format": TILE_FORMAT, "byte_order": "little", "bounds": list(bounds),
+    return {"format": tile_format, "byte_order": "little", "bounds": list(bounds),
             "fingerprint": expected_fingerprint, "fragments": fragments, "triangles": triangles,
             "channels": {name: blobs.put(data) for name, data in raw.items()}}
 
@@ -114,14 +177,15 @@ def encode(rendered, bounds, expected_fingerprint, blobs):
 def descriptors(payload, bounds, expected_fingerprint):
     """Validate a manifest without reading bytes, including in DB backups."""
     pixels = validate_bounds(bounds)
-    require(isinstance(payload, dict) and payload.get("format") == TILE_FORMAT and
-            payload.get("byte_order") == "little", "tile_format", "Unknown persisted tile format", 409)
+    channels_def = _channel_set(payload)
+    require(isinstance(payload, dict) and payload.get("byte_order") == "little",
+            "tile_format", "Unknown persisted tile format", 409)
     require(payload.get("bounds") == list(bounds) and payload.get("fingerprint") == expected_fingerprint,
             "tile_fingerprint", "Tile payload does not match its manifest", 409)
     channels = payload.get("channels")
-    require(isinstance(channels, dict) and set(channels) == set(CHANNELS),
+    require(isinstance(channels, dict) and set(channels) == set(channels_def),
             "tile_format", "Tile channel set is incomplete", 409)
-    for name, (code, size, stride) in CHANNELS.items():
+    for name, (code, size, stride) in channels_def.items():
         descriptor = channels[name]
         require(isinstance(descriptor, dict) and isinstance(descriptor.get("sha256"), str) and
                 re.fullmatch(r"[a-f0-9]{64}", descriptor["sha256"]) and
@@ -134,18 +198,33 @@ def descriptors(payload, bounds, expected_fingerprint):
 
 def decode(payload, bounds, expected_fingerprint, blobs, objects=None):
     pixels = validate_bounds(bounds)
+    channels_def = _channel_set(payload)
     channels = descriptors(payload, bounds, expected_fingerprint)
     decoded = {}
-    for name, (code, size, stride) in CHANNELS.items():
+    for name, (code, size, stride) in channels_def.items():
         descriptor = channels[name]
         raw = blobs.read(descriptor["sha256"])
         require(len(raw) == descriptor["size"], "tile_extent", "Tile content length mismatch", 409)
         decoded[name] = _values(raw, code, size)
-    _samples(decoded["depth.f64"], decoded["color.f32"], decoded["object.u32"], pixels, objects)
+    transparent = payload.get("format") == TILE_FORMAT_V2
+    if transparent:
+        extra = (decoded["contributor.u32"], decoded["contribution.f32"],
+                 decoded["layers.u16"], decoded["truncated.u8"], decoded["overflow.u32"])
+        _samples(decoded["depth.f64"], decoded["color.f32"], decoded["object.u32"],
+                 pixels, objects, extra)
+    else:
+        _samples(decoded["depth.f64"], decoded["color.f32"], decoded["object.u32"], pixels, objects)
     fragments = integer(payload.get("fragments"), "tile fragments", 0, 2**63 - 1)
     triangles = integer(payload.get("triangles"), "tile triangles", 0, 2**63 - 1)
-    return {"depth": decoded["depth.f64"], "colors": decoded["color.f32"],
-            "ids": decoded["object.u32"], "fragments": fragments, "triangles": triangles}
+    result = {"depth": decoded["depth.f64"], "colors": decoded["color.f32"],
+              "ids": decoded["object.u32"], "fragments": fragments, "triangles": triangles}
+    if transparent:
+        result.update({"contributors": decoded["contributor.u32"],
+                       "contribution": decoded["contribution.f32"],
+                       "observed_layers": decoded["layers.u16"],
+                       "truncated": decoded["truncated.u8"],
+                       "overflow_fragments": decoded["overflow.u32"]})
+    return result
 
 
 def assemble(plan, records, edge, expected_fingerprint, blobs, checkpoint):
@@ -153,9 +232,17 @@ def assemble(plan, records, edge, expected_fingerprint, blobs, checkpoint):
     validate_partition(records, width, height, edge, expected_fingerprint)
     require(all(record["state"] == "complete" for record in records),
             "tile_incomplete", "Cannot assemble an unfinished exposure", 409)
-    depth = array("d", [math.inf]) * (width * height)
-    ids = array("I", [0]) * (width * height)
-    colors = array("f", [0.]) * (width * height * 3)
+    transparent = bool(plan.get("transparent"))
+    length = width * height
+    depth = array("d", [math.inf]) * length
+    ids = array("I", [0]) * length
+    colors = array("f", [0.]) * (length * 3)
+    if transparent:
+        contributors = array("I", [0]) * length
+        contribution = array("f", [0.]) * length
+        layers = array("H", [0]) * length
+        truncated = bytearray(length)
+        overflow = array("I", [0]) * length
     fragments = 0
     for record in sorted(records, key=lambda value: value["ordinal"]):
         checkpoint()
@@ -170,7 +257,19 @@ def assemble(plan, records, edge, expected_fingerprint, blobs, checkpoint):
             depth[target:target + local_width] = tile["depth"][source:source + local_width]
             ids[target:target + local_width] = tile["ids"][source:source + local_width]
             colors[target * 3:(target + local_width) * 3] = tile["colors"][source * 3:(source + local_width) * 3]
+            if transparent:
+                contributors[target:target + local_width] = tile["contributors"][source:source + local_width]
+                contribution[target:target + local_width] = tile["contribution"][source:source + local_width]
+                layers[target:target + local_width] = tile["observed_layers"][source:source + local_width]
+                truncated[target:target + local_width] = tile["truncated"][source:source + local_width]
+                overflow[target:target + local_width] = tile["overflow_fragments"][source:source + local_width]
         fragments += tile["fragments"]
     checkpoint()
-    return {"depth": depth, "ids": ids, "colors": colors,
-            "fragments": fragments, "triangles": len(plan["triangles"])}
+    result = {"depth": depth, "ids": ids, "colors": colors,
+              "fragments": fragments, "triangles": len(plan["triangles"])}
+    if transparent:
+        result.update({"contributors": contributors, "contribution": contribution,
+                       "observed_layers": layers, "truncated": truncated,
+                       "overflow_fragments": overflow,
+                       "layer_budget": plan["layer_budget"]})
+    return result

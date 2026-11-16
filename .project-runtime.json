@@ -98,6 +98,10 @@
     {
       "workflow_id": "content-inspection",
       "command": "python3 -m facetproof.demo --flow content-inspection"
+    },
+    {
+      "workflow_id": "transparency-shell",
+      "command": "python3 -m facetproof.demo --flow transparency-shell"
     }
   ]
 }

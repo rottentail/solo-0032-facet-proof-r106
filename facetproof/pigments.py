@@ -14,8 +14,13 @@ def linear_to_srgb(value):
 def validate_pigment(data):
     object_value(data)
     rgb = vector(data.get("color"), "color", low=0, high=1)
+    # opacity=1 keeps the legacy opaque path byte-for-byte identical. Values
+    # below 1 opt the frozen placement into the order-independent transparency
+    # semantics (facet-raster-2) and are frozen with the seal.
+    opacity = scalar(data.get("opacity", 1), "opacity", 0, 1)
     return {"name": text(data.get("name"), "name"), "color": rgb,
             "linear": [srgb_to_linear(v) for v in rgb],
+            "opacity": opacity,
             "roughness": scalar(data.get("roughness", .65), "roughness", .05, 1),
             "specular": scalar(data.get("specular", .2), "specular", 0, 1),
             "two_sided": boolean(data.get("two_sided", False), "two_sided")}
